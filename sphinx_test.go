@@ -2,6 +2,7 @@ package sphinx
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -145,6 +146,147 @@ func newTestRoute(numHops int) ([]*Router, *PaymentPath, *[]HopData, *OnionPacke
 	}
 
 	return nodes, &route, &hopsData, fwdMsg, nil
+}
+
+func newOnionMessageRoute(numHops int) (*OnionPacket, *PaymentPath, []*Router,
+	error) {
+
+	if numHops < 2 {
+		return nil, nil, nil, fmt.Errorf("at least 2 hops are " +
+			"required to create an onion message route")
+	}
+
+	// Create routers for each hop.
+	nodes := make([]*Router, numHops)
+	for i := 0; i < numHops; i++ {
+		privKey, err := btcec.NewPrivateKey()
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("unable to generate "+
+				"random key for sphinx node: %v", err)
+		}
+		nodes[i] = NewRouter(
+			&PrivKeyECDH{PrivKey: privKey}, NewMemoryReplayLog(),
+		)
+	}
+
+	// Split the nodes into two parts for creating two blinded paths.
+	mid := numHops / 2
+	firstPathNodes := nodes[:mid]
+	secondPathNodes := nodes[mid:]
+
+	// Create the sessions keys for the two blinded paths.
+	firstSessionKey, _ := btcec.NewPrivateKey()
+	secondSessionKey, _ := btcec.NewPrivateKey()
+
+	// Create the first blinded path, adding a next_path_key_override TLV
+	// at the last node.
+	firstPathInfos := make([]*HopInfo, len(firstPathNodes))
+	for i, node := range firstPathNodes {
+		nextNodeID := node.onionKey.PubKey().SerializeCompressed()
+		var b bytes.Buffer
+		if i == len(firstPathNodes)-1 {
+			secondsSessPub := secondSessionKey.PubKey()
+			pathKeyOverride := secondsSessPub.SerializeCompressed()
+			// Encode TLV record for type 4 (next node ID)
+			b.Write(encodeTLVRecord(4, nextNodeID))
+			// Encode TLV record for type 8 (path key override)
+			b.Write(encodeTLVRecord(8, pathKeyOverride))
+		} else {
+			// Encode TLV record for type 4 (next node ID)
+			b.Write(encodeTLVRecord(4, nextNodeID))
+		}
+		firstPathInfos[i] = &HopInfo{
+			NodePub:   node.onionKey.PubKey(),
+			PlainText: b.Bytes(),
+		}
+	}
+	firstBlindedPath, err := BuildBlindedPath(
+		firstSessionKey, firstPathInfos,
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error generating first "+
+			"blinded path: %v", err)
+	}
+
+	// Create the second blinded path, omitting the next_node_id TLV for the
+	// last node.
+	secondPathInfos := make([]*HopInfo, len(secondPathNodes))
+	for i, node := range secondPathNodes {
+		nextNodeID := node.onionKey.PubKey().SerializeCompressed()
+		var b bytes.Buffer
+		if i == len(secondPathNodes)-1 {
+			pathID := make([]byte, 20)
+			if _, err := rand.Read(pathID); err != nil {
+				return nil, nil, nil, fmt.Errorf("unable to "+
+					"generate random path ID: %v", err)
+			}
+			// Encode TLV record for type 6 (path ID)
+			b.Write(encodeTLVRecord(6, pathID))
+		} else {
+			// Encode TLV record for type 4 (next node ID)
+			b.Write(encodeTLVRecord(4, nextNodeID))
+		}
+
+		secondPathInfos[i] = &HopInfo{
+			NodePub:   node.onionKey.PubKey(),
+			PlainText: b.Bytes(),
+		}
+	}
+	secondBlindedPath, err := BuildBlindedPath(
+		secondSessionKey, secondPathInfos,
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error generating second "+
+			"blinded path: %v", err)
+	}
+
+	blindedPath := &BlindedPath{
+		IntroductionPoint: firstBlindedPath.Path.IntroductionPoint,
+		BlindingPoint:     firstBlindedPath.Path.BlindingPoint,
+		BlindedHops: append(
+			firstBlindedPath.Path.BlindedHops,
+			secondBlindedPath.Path.BlindedHops...,
+		),
+	}
+
+	// Create the route from the blinded path, always adding the
+	// hop.CipherText as a TLV field type 4.
+	var route PaymentPath
+	for i, hop := range blindedPath.BlindedHops {
+		var b bytes.Buffer
+
+		if i == len(blindedPath.BlindedHops)-1 {
+			hello := []byte("hello")
+			// Encode TLV record for type 4 (cipher text)
+			b.Write(encodeTLVRecord(4, hop.CipherText))
+			// Encode TLV record for type 65 (hello message)
+			b.Write(encodeTLVRecord(65, hello))
+		} else {
+			// Encode TLV record for type 4 (cipher text)
+			b.Write(encodeTLVRecord(4, hop.CipherText))
+		}
+
+		route[i] = OnionHop{
+			NodePub: *hop.BlindedNodePub,
+			HopPayload: HopPayload{
+				Type:    PayloadTLV,
+				Payload: b.Bytes(),
+			},
+		}
+	}
+
+	// Generate the onion packet.
+	sessionKey, _ := btcec.NewPrivateKey()
+	onionPacket, err := NewOnionPacket(
+		&route, sessionKey, nil, DeterministicPacketFiller,
+		MaxRoutingPayloadSize, MaxOnionMessagePayloadSize,
+	)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("unable to create onion "+
+			"packet: %v", err)
+	}
+
+	return onionPacket, &route, nodes, nil
 }
 
 func TestBolt4Packet(t *testing.T) {
@@ -709,6 +851,62 @@ func mustNewLegacyHopPayload(hopData *HopData) HopPayload {
 	return payload
 }
 
+// TestPaymentPathTotalPayloadSizeExceeds1300 tests that a PaymentPath can have
+// a TotalPayloadSize greater than 1300 bytes.
+func TestPaymentPathTotalPayloadSizeExceeds1300(t *testing.T) {
+	onionPacket, route, _, err := newOnionMessageRoute(15)
+	require.NoError(t, err, "newOnionMessageRoute should not return an "+
+		"error")
+
+	totalSize := route.TotalPayloadSize()
+	require.Greater(t, totalSize, 1300, "TotalPayloadSize should be "+
+		"greater than 1300")
+
+	require.Equal(t, MaxOnionMessagePayloadSize,
+		len(onionPacket.RoutingInfo), "RoutingInfo length should "+
+			"be equal to MaxOnionMessagePayloadSize")
+}
+
+// TestCustomPayloadSize tests that we can create an onion packet with any size
+// of routing info.
+func TestCustomPayloadSize(t *testing.T) {
+	t.Parallel()
+
+	customPayloadSize := 1234
+
+	// First, create a privKey that will act as the destination hop in the
+	// path.
+	privKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	// Next, create a session key for the onion packet.
+	sessionKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	// We'll create a simple one-hop path.
+	path := &PaymentPath{
+		{
+			NodePub: *privKey.PubKey(),
+		},
+	}
+
+	// The hop payload will be extremely simple
+	payload, err := NewTLVHopPayload([]byte{1, 2, 3})
+	require.NoError(t, err)
+	path[0].HopPayload = payload
+
+	// Now, create the onion packet.
+	onionPacket, err := NewOnionPacket(
+		path, sessionKey, nil, DeterministicPacketFiller,
+		customPayloadSize,
+	)
+	require.NoError(t, err)
+
+	require.Equal(t, customPayloadSize, len(onionPacket.RoutingInfo),
+		"RoutingInfo length should be equal to customPayloadSize")
+
+}
+
 // TestSphinxHopVariableSizedPayloads tests that we're able to fully decode an
 // EOB payload that was targeted at the final hop in a route, and also when
 // intermediate nodes have EOB data encoded as well. Additionally, we test that
@@ -828,7 +1026,7 @@ func TestSphinxHopVariableSizedPayloads(t *testing.T) {
 					Payload: bytes.Repeat([]byte("a"), 500),
 				},
 			},
-			expectedError: ErrMaxRoutingInfoSizeExceeded,
+			expectedError: ErrPayloadSizeExceeded,
 		},
 	}
 

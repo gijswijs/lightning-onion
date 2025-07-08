@@ -70,6 +70,12 @@ func main() {
 						"data.",
 					Value: defaultHopDataPath,
 				},
+				cli.BoolFlag{
+					Name: "onion-message",
+					Usage: "Create an onion message " +
+						"packet rather than a " +
+						"payment onion.",
+				},
 			},
 		},
 		{
@@ -203,8 +209,18 @@ func generate(ctx *cli.Context) error {
 		return fmt.Errorf("could not peel onion spec: %v", err)
 	}
 
+	payloadSizes := []int{
+		sphinx.MaxRoutingPayloadSize,
+	}
+	if ctx.Bool("onion-message") {
+		payloadSizes = append(
+			payloadSizes,
+			sphinx.MaxOnionMessagePayloadSize,
+		)
+	}
 	msg, err := sphinx.NewOnionPacket(
 		path, sessionKey, assocData, sphinx.DeterministicPacketFiller,
+		payloadSizes...,
 	)
 	if err != nil {
 		return fmt.Errorf("error creating message: %v", err)
