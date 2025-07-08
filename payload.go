@@ -99,15 +99,15 @@ func (hp *HopPayload) Decode(r io.Reader) error {
 		return err
 	}
 
-	var (
-		legacyPayload = isLegacyPayloadByte(peekByte[0])
-		payloadSize   uint16
-	)
+	var payloadSize uint16
 
-	if legacyPayload {
+	// If the HopPayload isn't guaranteed to be a TLV payload, we check the
+	// first byte to see if it is a legacy payload.
+	if hp.Type != PayloadTLV && isLegacyPayloadByte(peekByte[0]) {
 		payloadSize = legacyPayloadSize()
-		hp.Type = PayloadLegacy
 	} else {
+		// If the first byte doesn't indicate a legacy payload, then it
+		// *must* be a TLV payload.
 		payloadSize, err = tlvPayloadSize(bufReader)
 		if err != nil {
 			return err
@@ -116,19 +116,7 @@ func (hp *HopPayload) Decode(r io.Reader) error {
 		hp.Type = PayloadTLV
 	}
 
-	// Now that we know the payload size, we'll create a  new buffer to
-	// read it out in full.
-	//
-	// TODO(roasbeef): can avoid all these copies
-	hp.Payload = make([]byte, payloadSize)
-	if _, err := io.ReadFull(bufReader, hp.Payload[:]); err != nil {
-		return err
-	}
-	if _, err := io.ReadFull(bufReader, hp.HMAC[:]); err != nil {
-		return err
-	}
-
-	return nil
+	return readPayloadAndHMAC(hp, bufReader, payloadSize)
 }
 
 // HopData attempts to extract a set of forwarding instructions from the target
@@ -144,6 +132,22 @@ func (hp *HopPayload) HopData() (*HopData, error) {
 	}
 
 	return nil, nil
+}
+
+// readPayloadAndHMAC reads the payload and HMAC from the reader into the
+// HopPayload.
+func readPayloadAndHMAC(hp *HopPayload, r io.Reader, payloadSize uint16) error {
+	// Now that we know the payload size, we'll create a new buffer to read
+	// it out in full.
+	hp.Payload = make([]byte, payloadSize)
+	if _, err := io.ReadFull(r, hp.Payload[:]); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(r, hp.HMAC[:]); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // tlvPayloadSize uses the passed reader to extract the payload length encoded
@@ -314,8 +318,12 @@ func legacyNumBytes() int {
 	return LegacyHopDataSize
 }
 
-// isLegacyPayload returns true if the given byte is equal to the 0x00 byte
-// which indicates that the payload should be decoded as a legacy payload.
+// isLegacyPayloadByte determines if the first byte of a hop payload indicates
+// that it is a legacy payload. The first byte of a legacy payload will always
+// be 0x00, as this is the realm. For TLV payloads, the first byte is a
+// var-int encoding the length of the payload. A TLV stream can be empty, in
+// which case its length is 0, which is also encoded as a 0x00 byte. This
+// creates an ambiguity between a legacy payload and an empty TLV payload.
 func isLegacyPayloadByte(b byte) bool {
 	return b == 0x00
 }
